@@ -8,156 +8,103 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
+// ===== ROOT =====
 app.get("/", (req, res) => {
   res.send("VOXDIGITS RENDER BACKEND OK");
 });
 
+// ===== HEALTH =====
 app.get("/health", (req, res) => {
   res.json({ ok: true });
 });
 
-app.get("/debug-env", (req, res) => {
-  res.json({
-    hasAccountSid: !!process.env.TWILIO_ACCOUNT_SID,
-    hasApiKey: !!process.env.TWILIO_API_KEY,
-    hasApiSecret: !!process.env.TWILIO_API_SECRET,
-    hasTwimlAppSid: !!process.env.TWIML_APP_SID,
-    hasCallerId: !!process.env.TWILIO_CALLER_ID,
-    hasClientIdentity: !!process.env.TWILIO_CLIENT_IDENTITY
-  });
-});
-
+// ===== TOKEN (VOICE) =====
 app.get("/generateToken", (req, res) => {
-  try {
-    const accountSid = process.env.TWILIO_ACCOUNT_SID;
-    const apiKey = process.env.TWILIO_API_KEY;
-    const apiSecret = process.env.TWILIO_API_SECRET;
-    const appSid = process.env.TWIML_APP_SID;
-    const identity = process.env.TWILIO_CLIENT_IDENTITY || "voxdigits_user";
+  const AccessToken = twilio.jwt.AccessToken;
+  const VoiceGrant = AccessToken.VoiceGrant;
 
-    if (!accountSid) return res.status(500).json({ error: "Missing TWILIO_ACCOUNT_SID" });
-    if (!apiKey) return res.status(500).json({ error: "Missing TWILIO_API_KEY" });
-    if (!apiSecret) return res.status(500).json({ error: "Missing TWILIO_API_SECRET" });
-    if (!appSid) return res.status(500).json({ error: "Missing TWIML_APP_SID" });
+  const token = new AccessToken(
+    process.env.TWILIO_ACCOUNT_SID,
+    process.env.TWILIO_API_KEY,
+    process.env.TWILIO_API_SECRET,
+    { identity: process.env.TWILIO_CLIENT_IDENTITY || "voxdigits_user" }
+  );
 
-    const AccessToken = twilio.jwt.AccessToken;
-    const VoiceGrant = AccessToken.VoiceGrant;
+  const voiceGrant = new VoiceGrant({
+    outgoingApplicationSid: process.env.TWIML_APP_SID,
+    incomingAllow: true,
+  });
 
-    const token = new AccessToken(accountSid, apiKey, apiSecret, { identity });
+  token.addGrant(voiceGrant);
 
-    const voiceGrant = new VoiceGrant({
-      outgoingApplicationSid: appSid,
-      incomingAllow: true
-    });
-
-    token.addGrant(voiceGrant);
-
-    return res.json({
-      ok: true,
-      identity,
-      token: token.toJwt()
-    });
-  } catch (err) {
-    console.error("TOKEN ERROR:", err);
-    return res.status(500).json({ error: err.message || "Token generation failed" });
-  }
+  res.json({ token: token.toJwt() });
 });
 
-// OUTBOUND VOICE
+// ===== VOICE ROUTE =====
 app.post("/voice", (req, res) => {
+  const VoiceResponse = twilio.twiml.VoiceResponse;
+  const twiml = new VoiceResponse();
+
+  const to = req.body.To;
+
+  const dial = twiml.dial({
+    callerId: process.env.TWILIO_CALLER_ID
+  });
+
+  if (to) {
+    dial.number(to);
+  } else {
+    twiml.say("No destination number provided");
+  }
+
+  res.type("text/xml");
+  res.send(twiml.toString());
+});
+
+// ==========================
+// ✅ SMS SEND (OUTBOUND)
+// ==========================
+app.post("/send-sms", async (req, res) => {
   try {
-    console.log("VOICE ROUTE HIT");
-    console.log("BODY:", req.body);
+    const client = twilio(
+      process.env.TWILIO_ACCOUNT_SID,
+      process.env.TWILIO_AUTH_TOKEN
+    );
 
-    const VoiceResponse = twilio.twiml.VoiceResponse;
-    const twiml = new VoiceResponse();
+    const { to, body } = req.body;
 
-    const to = req.body.To || req.body.to || req.query.To || req.query.to;
-    const callerId = process.env.TWILIO_CALLER_ID;
-
-    console.log("TO:", to);
-    console.log("CALLER ID:", callerId);
-
-    if (!callerId) {
-      twiml.say("Caller ID missing.");
-      return res.type("text/xml").send(twiml.toString());
-    }
-
-    if (!to) {
-      twiml.say("No destination number.");
-      return res.type("text/xml").send(twiml.toString());
-    }
-
-    const dial = twiml.dial({
-      callerId,
-      answerOnBridge: true,
-      timeout: 30
+    const message = await client.messages.create({
+      body: body,
+      from: process.env.TWILIO_CALLER_ID,
+      to: to,
     });
 
-    dial.number(String(to).trim());
-
-    return res.type("text/xml").send(twiml.toString());
+    res.json({ success: true, sid: message.sid });
   } catch (err) {
-    console.error("VOICE ERROR:", err);
-    return res.status(500).type("text/plain").send("Voice route failed");
+    console.error(err);
+    res.status(500).json({ error: err.message });
   }
 });
 
-// INBOUND VOICE
-app.post("/incoming", (req, res) => {
-  try {
-    console.log("INCOMING ROUTE HIT");
-
-    const VoiceResponse = twilio.twiml.VoiceResponse;
-    const twiml = new VoiceResponse();
-
-    const identity = process.env.TWILIO_CLIENT_IDENTITY || "voxdigits_user";
-
-    const dial = twiml.dial({
-      answerOnBridge: true,
-      timeout: 25
-    });
-
-    dial.client(identity);
-
-    return res.type("text/xml").send(twiml.toString());
-  } catch (err) {
-    console.error("INCOMING ERROR:", err);
-    return res.status(500).type("text/plain").send("Incoming route failed");
-  }
-});
-
-// INBOUND SMS
+// ==========================
+// ✅ SMS RECEIVE (INBOUND)
+// ==========================
 app.post("/sms", (req, res) => {
-  try {
-    console.log("SMS ROUTE HIT");
-    console.log("SMS BODY:", req.body);
+  const MessagingResponse = twilio.twiml.MessagingResponse;
+  const twiml = new MessagingResponse();
 
-    const MessagingResponse = twilio.twiml.MessagingResponse;
-    const twiml = new MessagingResponse();
+  const incomingMsg = req.body.Body;
 
-    const from = req.body.From || "";
-    const body = (req.body.Body || "").trim();
+  console.log("Incoming SMS:", incomingMsg);
 
-    console.log("SMS FROM:", from);
-    console.log("SMS TEXT:", body);
+  twiml.message("Message received on VoxDigits ✅");
 
-    if (!body) {
-      twiml.message("Message received on VoxDigits.");
-      return res.type("text/xml").send(twiml.toString());
-    }
-
-    twiml.message(VoxDigits received: ${body});
-
-    return res.type("text/xml").send(twiml.toString());
-  } catch (err) {
-    console.error("SMS ERROR:", err);
-    return res.status(500).type("text/plain").send("SMS route failed");
-  }
+  res.type("text/xml");
+  res.send(twiml.toString());
 });
 
+// ===== START SERVER =====
 const PORT = process.env.PORT || 3000;
-
 app.listen(PORT, () => {
   console.log("Server running on port " + PORT);
-});
+})
