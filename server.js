@@ -4,8 +4,8 @@ const twilio = require("twilio");
 const app = express();
 
 // Twilio sends webhook data as application/x-www-form-urlencoded
-app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 const PORT = process.env.PORT || 10000;
 
